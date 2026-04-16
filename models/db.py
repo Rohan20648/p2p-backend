@@ -8,13 +8,15 @@ def get_connection():
         password=os.getenv("MYSQL_PASSWORD", ""),
         database=os.getenv("MYSQL_DB", "p2p_energy"),
         port=int(os.getenv("MYSQL_PORT", 3306)),
-        cursorclass=pymysql.cursors.DictCursor
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,           # explicit commit/rollback
     )
 
 def query(sql, args=None, fetch="all"):
+    """Single-query helper (auto-commits). Use transact() for multi-step writes."""
     try:
         conn = get_connection()
-        cur = conn.cursor()
+        cur  = conn.cursor()
         cur.execute(sql, args or ())
         if fetch == "all":
             data = cur.fetchall()
@@ -27,6 +29,36 @@ def query(sql, args=None, fetch="all"):
         return data, None
     except Exception as e:
         import traceback; traceback.print_exc()
+        return None, str(e)
+
+def transact(steps):
+    """
+    Run multiple write steps in a single DB transaction.
+
+    steps  — list of (sql, args) tuples executed in order.
+    Returns (list_of_results, error_string_or_None).
+
+    Each result is {"affected_rows": N, "lastrowid": M}.
+    On any error the transaction is rolled back.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        results = []
+        for sql, args in steps:
+            cur.execute(sql, args or ())
+            results.append({"affected_rows": cur.rowcount, "lastrowid": cur.lastrowid})
+        conn.commit()
+        cur.close(); conn.close()
+        return results, None
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        if conn:
+            try: conn.rollback()
+            except: pass
+            try: conn.close()
+            except: pass
         return None, str(e)
 
 def success(data=None, message="ok", status=200):

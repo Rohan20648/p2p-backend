@@ -1,4 +1,4 @@
-from flask import Flask, g
+from flask import Flask
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
@@ -10,7 +10,6 @@ def create_app():
     app.url_map.strict_slashes = False
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    # ── Register blueprints ──────────────────────────────
     from routes.users          import users_bp
     from routes.listings       import listings_bp
     from routes.orders         import orders_bp
@@ -45,5 +44,5 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    PORT = int(os.getenv("PORT", 3000))
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    PORT = int(os.getenv("PORT", 5000))   # fixed: was 3000, Flask default is 5000
+    app.run(host="0.0.0.0", port=PORT, debug=os.getenv("FLASK_DEBUG", "true").lower() == "true")

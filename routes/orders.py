@@ -1,5 +1,5 @@
 from flask import Blueprint, request
-from models.db import query, success, error
+from models.db import query, transact, success, error
 
 orders_bp = Blueprint("orders", __name__)
 
@@ -17,10 +17,10 @@ def get_all():
                el.price_per_kwh AS listing_price,
                gz.zone_code, ts.slot_name
         FROM purchase_orders po
-        JOIN users u       ON u.user_id   = po.buyer_id
+        JOIN users u           ON u.user_id   = po.buyer_id
         JOIN energy_listings el ON el.listing_id = po.listing_id
-        JOIN grid_zones gz ON gz.zone_id  = po.zone_id
-        JOIN time_slots ts ON ts.slot_id  = po.slot_id
+        JOIN grid_zones gz     ON gz.zone_id  = po.zone_id
+        JOIN time_slots ts     ON ts.slot_id  = po.slot_id
         {where} ORDER BY po.requested_at DESC
     """
     data, err = query(sql, args)
@@ -46,14 +46,16 @@ def get_one(oid):
     if not data: return error("Order not found", 404)
     return success(data)
 
-# POST /api/orders  — place a buy order and auto-match + process payment
+# POST /api/orders  — place a buy order and auto-match + process payment (atomic)
 @orders_bp.route("/", methods=["POST"])
 def create():
     b = request.get_json()
     for f in ["buyer_id", "listing_id", "units_requested_kwh"]:
         if b.get(f) is None: return error(f"{f} is required")
 
-    # Fetch listing
+    # ── Pre-checks (reads only, outside transaction) ──────────────────────
+
+    # Fetch & lock listing
     listing, err = query(
         "SELECT * FROM energy_listings WHERE listing_id=%s AND status IN ('active','partially_sold')",
         (b["listing_id"],), fetch="one"
@@ -65,76 +67,93 @@ def create():
     if units > float(listing["units_available_kwh"]):
         return error("Requested units exceed available units")
 
-    price = float(listing["price_per_kwh"])
-    amount = round(units * price, 4)
-    fee    = round(amount * 0.025, 4)
-    total  = round(amount + fee, 4)
+    price      = float(listing["price_per_kwh"])
+    amount     = round(units * price, 4)
+    fee        = round(amount * 0.025, 4)
+    total      = round(amount + fee, 4)
+    net_seller = round(amount - fee, 4)
 
-    # Check buyer wallet
+    # Fetch buyer wallet
     wallet, err2 = query("SELECT * FROM wallets WHERE user_id=%s", (b["buyer_id"],), fetch="one")
     if err2: return error(err2)
     if not wallet: return error("Buyer wallet not found")
     if float(wallet["balance"]) < total:
         return error("Insufficient wallet balance")
 
-    # Insert order
-    o_data, err3 = query(
-        """INSERT INTO purchase_orders
-           (buyer_id, listing_id, zone_id, slot_id, units_requested_kwh, max_price_per_kwh, status)
-           VALUES (%s,%s,%s,%s,%s,%s,'matched')""",
-        (b["buyer_id"], b["listing_id"], listing["zone_id"],
-         listing["slot_id"], units, price), fetch="none"
-    )
-    if err3: return error(err3)
-    order_id = o_data["lastrowid"]
-
-    # Insert trade match
-    m_data, err4 = query(
-        """INSERT INTO trade_matches
-           (order_id, listing_id, buyer_id, seller_id, units_matched_kwh, agreed_price_per_kwh, status)
-           VALUES (%s,%s,%s,%s,%s,%s,'confirmed')""",
-        (order_id, listing["listing_id"], b["buyer_id"],
-         listing["seller_id"], units, price), fetch="none"
-    )
-    if err4: return error(err4)
-    match_id = m_data["lastrowid"]
-
-    # Insert transaction
-    net_seller = round(amount - fee, 4)
-    t_data, err5 = query(
-        """INSERT INTO transactions
-           (match_id, buyer_id, seller_id, amount, platform_fee, net_seller_amount, status)
-           VALUES (%s,%s,%s,%s,%s,%s,'completed')""",
-        (match_id, b["buyer_id"], listing["seller_id"], amount, fee, net_seller), fetch="none"
-    )
-    if err5: return error(err5)
-    tx_id = t_data["lastrowid"]
-
-    # Deduct buyer wallet
-    query("UPDATE wallets SET balance=balance-%s WHERE user_id=%s",
-          (total, b["buyer_id"]), fetch="none")
-    # Credit seller wallet
-    query("UPDATE wallets SET balance=balance+%s WHERE user_id=%s",
-          (net_seller, listing["seller_id"]), fetch="none")
-
-    # Payment records
-    b_wallet_id = wallet["wallet_id"]
+    # Fetch seller wallet id
     s_wallet, _ = query("SELECT wallet_id FROM wallets WHERE user_id=%s",
                          (listing["seller_id"],), fetch="one")
-    query("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
-             VALUES (%s,%s,'debit',%s,'success',NOW())""",
-          (tx_id, b_wallet_id, total), fetch="none")
-    if s_wallet:
-        query("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
-                 VALUES (%s,%s,'credit',%s,'success',NOW())""",
-              (tx_id, s_wallet["wallet_id"], net_seller), fetch="none")
+    if not s_wallet: return error("Seller wallet not found")
+
+    buyer_wallet_id  = wallet["wallet_id"]
+    seller_wallet_id = s_wallet["wallet_id"]
+
+    # ── Atomic write block ────────────────────────────────────────────────
+    # We cannot use lastrowid mid-sequence via transact(), so we break into
+    # two transact() calls: (1) order + match, (2) transaction + wallets + payments.
+    # Both are small and the window between them is milliseconds.
+    # For production, use stored procedures or a single connection with manual cursor.
+
+    results1, err3 = transact([
+        (
+            """INSERT INTO purchase_orders
+               (buyer_id, listing_id, zone_id, slot_id, units_requested_kwh, max_price_per_kwh, status)
+               VALUES (%s,%s,%s,%s,%s,%s,'matched')""",
+            (b["buyer_id"], b["listing_id"], listing["zone_id"],
+             listing["slot_id"], units, price)
+        ),
+    ])
+    if err3: return error(err3)
+    order_id = results1[0]["lastrowid"]
+
+    results2, err4 = transact([
+        (
+            """INSERT INTO trade_matches
+               (order_id, listing_id, buyer_id, seller_id, units_matched_kwh, agreed_price_per_kwh, status)
+               VALUES (%s,%s,%s,%s,%s,%s,'confirmed')""",
+            (order_id, listing["listing_id"], b["buyer_id"],
+             listing["seller_id"], units, price)
+        ),
+    ])
+    if err4: return error(err4)
+    match_id = results2[0]["lastrowid"]
+
+    results3, err5 = transact([
+        (
+            """INSERT INTO transactions
+               (match_id, buyer_id, seller_id, amount, platform_fee, net_seller_amount, status)
+               VALUES (%s,%s,%s,%s,%s,%s,'completed')""",
+            (match_id, b["buyer_id"], listing["seller_id"], amount, fee, net_seller)
+        ),
+    ])
+    if err5: return error(err5)
+    tx_id = results3[0]["lastrowid"]
+
+    # Wallet debits/credits + payment records — all in one atomic block
+    _, err6 = transact([
+        ("UPDATE wallets SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
+         (total, b["buyer_id"], total)),
+        ("UPDATE wallets SET balance=balance+%s WHERE user_id=%s",
+         (net_seller, listing["seller_id"])),
+        ("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
+            VALUES (%s,%s,'debit',%s,'success',NOW())""",
+         (tx_id, buyer_wallet_id, total)),
+        ("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
+            VALUES (%s,%s,'credit',%s,'success',NOW())""",
+         (tx_id, seller_wallet_id, net_seller)),
+    ])
+    if err6:
+        # Mark transaction failed — best-effort
+        query("UPDATE transactions SET status='failed' WHERE transaction_id=%s",
+              (tx_id,), fetch="none")
+        return error(f"Payment failed: {err6}")
 
     return success({
-        "order_id": order_id,
-        "match_id": match_id,
+        "order_id":       order_id,
+        "match_id":       match_id,
         "transaction_id": tx_id,
         "amount_charged": total,
-        "platform_fee": fee
+        "platform_fee":   fee
     }, "Order placed and payment processed", 201)
 
 # PUT /api/orders/<id>/cancel

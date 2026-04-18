@@ -3,8 +3,9 @@ from models.db import query, success, error
 
 notifications_bp = Blueprint("notifications", __name__)
 
-# GET /api/notifications/<user_id>?unread=true
-@notifications_bp.route("/<int:uid>", methods=["GET"])
+# FIX #6: renamed routes to avoid numeric-prefix ambiguity
+# GET /api/notifications/user/<user_id>?unread=true
+@notifications_bp.route("/user/<int:uid>", methods=["GET"])
 def get_all(uid):
     unread = request.args.get("unread")
     sql = """SELECT n.*, nt.type_name
@@ -19,8 +20,8 @@ def get_all(uid):
     if err: return error(err)
     return success(data)
 
-# PUT /api/notifications/<id>/read
-@notifications_bp.route("/<int:nid>/read", methods=["PUT"])
+# PUT /api/notifications/item/<id>/read
+@notifications_bp.route("/item/<int:nid>/read", methods=["PUT"])
 def mark_read(nid):
     data, err = query(
         "UPDATE notifications SET is_read=1, read_at=NOW() WHERE notification_id=%s",

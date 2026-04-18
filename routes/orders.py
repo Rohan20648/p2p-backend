@@ -1,5 +1,5 @@
 from flask import Blueprint, request
-from models.db import query, transact, success, error
+from models.db import query, transact_with_cursor, success, error
 
 orders_bp = Blueprint("orders", __name__)
 
@@ -46,115 +46,138 @@ def get_one(oid):
     if not data: return error("Order not found", 404)
     return success(data)
 
-# POST /api/orders  — place a buy order and auto-match + process payment (atomic)
+# POST /api/orders  — fully atomic: one connection, one transaction
 @orders_bp.route("/", methods=["POST"])
 def create():
     b = request.get_json()
     for f in ["buyer_id", "listing_id", "units_requested_kwh"]:
         if b.get(f) is None: return error(f"{f} is required")
 
-    # ── Pre-checks (reads only, outside transaction) ──────────────────────
-
-    # Fetch & lock listing
-    listing, err = query(
-        "SELECT * FROM energy_listings WHERE listing_id=%s AND status IN ('active','partially_sold')",
-        (b["listing_id"],), fetch="one"
-    )
-    if err: return error(err)
-    if not listing: return error("Listing not available", 404)
-
     units = float(b["units_requested_kwh"])
-    if units > float(listing["units_available_kwh"]):
-        return error("Requested units exceed available units")
 
-    price      = float(listing["price_per_kwh"])
-    amount     = round(units * price, 4)
-    fee        = round(amount * 0.025, 4)
-    total      = round(amount + fee, 4)
-    net_seller = round(amount - fee, 4)
+    def _atomic(conn, cur):
+        # ── FIX #2 & #3: Everything in one connection/transaction ────────
+        # Lock listing row with FOR UPDATE to prevent overselling
+        cur.execute(
+            "SELECT * FROM energy_listings WHERE listing_id=%s "
+            "AND status IN ('active','partially_sold') FOR UPDATE",
+            (b["listing_id"],)
+        )
+        listing = cur.fetchone()
+        if not listing:
+            raise ValueError("Listing not available")
 
-    # Fetch buyer wallet
-    wallet, err2 = query("SELECT * FROM wallets WHERE user_id=%s", (b["buyer_id"],), fetch="one")
-    if err2: return error(err2)
-    if not wallet: return error("Buyer wallet not found")
-    if float(wallet["balance"]) < total:
-        return error("Insufficient wallet balance")
+        if units > float(listing["units_available_kwh"]):
+            raise ValueError("Requested units exceed available units")
 
-    # Fetch seller wallet id
-    s_wallet, _ = query("SELECT wallet_id FROM wallets WHERE user_id=%s",
-                         (listing["seller_id"],), fetch="one")
-    if not s_wallet: return error("Seller wallet not found")
+        price      = float(listing["price_per_kwh"])
+        amount     = round(units * price, 4)
+        fee        = round(amount * 0.025, 4)
+        total      = round(amount + fee, 4)
+        net_seller = round(amount - fee, 4)
 
-    buyer_wallet_id  = wallet["wallet_id"]
-    seller_wallet_id = s_wallet["wallet_id"]
+        # FIX #3: Lock buyer wallet with FOR UPDATE — prevents TOCTOU race
+        cur.execute(
+            "SELECT * FROM wallets WHERE user_id=%s FOR UPDATE",
+            (b["buyer_id"],)
+        )
+        wallet = cur.fetchone()
+        if not wallet:
+            raise ValueError("Buyer wallet not found")
+        if float(wallet["balance"]) < total:
+            raise ValueError("Insufficient wallet balance")
 
-    # ── Atomic write block ────────────────────────────────────────────────
-    # We cannot use lastrowid mid-sequence via transact(), so we break into
-    # two transact() calls: (1) order + match, (2) transaction + wallets + payments.
-    # Both are small and the window between them is milliseconds.
-    # For production, use stored procedures or a single connection with manual cursor.
+        # Lock seller wallet
+        cur.execute(
+            "SELECT wallet_id FROM wallets WHERE user_id=%s FOR UPDATE",
+            (listing["seller_id"],)
+        )
+        s_wallet = cur.fetchone()
+        if not s_wallet:
+            raise ValueError("Seller wallet not found")
 
-    results1, err3 = transact([
-        (
+        buyer_wallet_id  = wallet["wallet_id"]
+        seller_wallet_id = s_wallet["wallet_id"]
+
+        # Insert purchase order
+        cur.execute(
             """INSERT INTO purchase_orders
                (buyer_id, listing_id, zone_id, slot_id, units_requested_kwh, max_price_per_kwh, status)
                VALUES (%s,%s,%s,%s,%s,%s,'matched')""",
             (b["buyer_id"], b["listing_id"], listing["zone_id"],
              listing["slot_id"], units, price)
-        ),
-    ])
-    if err3: return error(err3)
-    order_id = results1[0]["lastrowid"]
+        )
+        order_id = cur.lastrowid
 
-    results2, err4 = transact([
-        (
+        # Insert trade match
+        cur.execute(
             """INSERT INTO trade_matches
                (order_id, listing_id, buyer_id, seller_id, units_matched_kwh, agreed_price_per_kwh, status)
                VALUES (%s,%s,%s,%s,%s,%s,'confirmed')""",
             (order_id, listing["listing_id"], b["buyer_id"],
              listing["seller_id"], units, price)
-        ),
-    ])
-    if err4: return error(err4)
-    match_id = results2[0]["lastrowid"]
+        )
+        match_id = cur.lastrowid
 
-    results3, err5 = transact([
-        (
+        # Insert transaction record
+        cur.execute(
             """INSERT INTO transactions
                (match_id, buyer_id, seller_id, amount, platform_fee, net_seller_amount, status)
                VALUES (%s,%s,%s,%s,%s,%s,'completed')""",
             (match_id, b["buyer_id"], listing["seller_id"], amount, fee, net_seller)
-        ),
-    ])
-    if err5: return error(err5)
-    tx_id = results3[0]["lastrowid"]
+        )
+        tx_id = cur.lastrowid
 
-    # Wallet debits/credits + payment records — all in one atomic block
-    _, err6 = transact([
-        ("UPDATE wallets SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
-         (total, b["buyer_id"], total)),
-        ("UPDATE wallets SET balance=balance+%s WHERE user_id=%s",
-         (net_seller, listing["seller_id"])),
-        ("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
-            VALUES (%s,%s,'debit',%s,'success',NOW())""",
-         (tx_id, buyer_wallet_id, total)),
-        ("""INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
-            VALUES (%s,%s,'credit',%s,'success',NOW())""",
-         (tx_id, seller_wallet_id, net_seller)),
-    ])
-    if err6:
-        # Mark transaction failed — best-effort
-        query("UPDATE transactions SET status='failed' WHERE transaction_id=%s",
-              (tx_id,), fetch="none")
-        return error(f"Payment failed: {err6}")
+        # Debit buyer wallet (guarded: only proceeds if balance still sufficient)
+        cur.execute(
+            "UPDATE wallets SET balance=balance-%s WHERE user_id=%s AND balance>=%s",
+            (total, b["buyer_id"], total)
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Insufficient wallet balance (concurrent update)")
 
-    return success({
-        "order_id":       order_id,
-        "match_id":       match_id,
-        "transaction_id": tx_id,
-        "amount_charged": total,
-        "platform_fee":   fee
-    }, "Order placed and payment processed", 201)
+        # Credit seller wallet
+        cur.execute(
+            "UPDATE wallets SET balance=balance+%s WHERE user_id=%s",
+            (net_seller, listing["seller_id"])
+        )
+
+        # Payment records
+        cur.execute(
+            """INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
+               VALUES (%s,%s,'debit',%s,'success',NOW())""",
+            (tx_id, buyer_wallet_id, total)
+        )
+        cur.execute(
+            """INSERT INTO payments (transaction_id, wallet_id, payment_type, amount, status, paid_at)
+               VALUES (%s,%s,'credit',%s,'success',NOW())""",
+            (tx_id, seller_wallet_id, net_seller)
+        )
+
+        # Update listing units / status (trigger also does this, but be explicit)
+        new_units = float(listing["units_available_kwh"]) - units
+        cur.execute(
+            "UPDATE energy_listings SET units_available_kwh=%s, status=%s WHERE listing_id=%s",
+            (new_units, "sold" if new_units <= 0 else "partially_sold", listing["listing_id"])
+        )
+
+        return {
+            "order_id":       order_id,
+            "match_id":       match_id,
+            "transaction_id": tx_id,
+            "amount_charged": total,
+            "platform_fee":   fee,
+        }
+
+    result, err = transact_with_cursor(_atomic)
+    if err:
+        # Surface user-friendly messages for expected errors
+        msg = str(err)
+        if "Listing not available" in msg or "Insufficient" in msg or "exceed" in msg:
+            return error(msg, 400)
+        return error(f"Order failed: {msg}")
+
+    return success(result, "Order placed and payment processed", 201)
 
 # PUT /api/orders/<id>/cancel
 @orders_bp.route("/<int:oid>/cancel", methods=["PUT"])

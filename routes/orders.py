@@ -159,7 +159,7 @@ def create():
         # tiny negatives (e.g. 10.0 - 10.0 == -1.4e-14) which violates
         # the energy_listings_chk_1 constraint (units_available_kwh >= 0).
         new_units = max(0.0, round(float(listing["units_available_kwh"]) - units, 4))
-        new_status = "sold" if new_units == 0 else "partially_sold"
+        new_status = "sold" if new_units == 0 else "active"
         cur.execute(
             "UPDATE energy_listings SET units_available_kwh=%s, status=%s WHERE listing_id=%s",
             (new_units, new_status, listing["listing_id"])

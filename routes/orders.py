@@ -154,16 +154,9 @@ def create():
             (tx_id, seller_wallet_id, net_seller)
         )
 
-        # Update listing units / status (trigger also does this, but be explicit)
-        # Use round() + max() to guard against floating-point underflow producing
-        # tiny negatives (e.g. 10.0 - 10.0 == -1.4e-14) which violates
-        # the energy_listings_chk_1 constraint (units_available_kwh >= 0).
-        new_units = max(0.0, round(float(listing["units_available_kwh"]) - units, 4))
-        new_status = "sold" if new_units == 0 else "active"
-        cur.execute(
-            "UPDATE energy_listings SET units_available_kwh=%s, status=%s WHERE listing_id=%s",
-            (new_units, new_status, listing["listing_id"])
-        )
+        # NOTE: energy_listings is updated by the after_match_insert trigger
+        # (fires on INSERT INTO trade_matches). No manual UPDATE needed here —
+        # doing it again would double-deduct the units.
 
         return {
             "order_id":       order_id,

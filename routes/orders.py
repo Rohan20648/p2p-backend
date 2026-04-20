@@ -155,7 +155,9 @@ def create():
         )
 
         # Update listing units / status (trigger also does this, but be explicit)
-        new_units = float(listing["units_available_kwh"]) - units
+        
+new_units = max(0.0, round(float(listing["units_available_kwh"]) - units, 4))
+new_status = "sold" if new_units == 0 else "partially_sold"
         cur.execute(
             "UPDATE energy_listings SET units_available_kwh=%s, status=%s WHERE listing_id=%s",
             (new_units, "sold" if new_units <= 0 else "partially_sold", listing["listing_id"])
